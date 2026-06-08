@@ -17,7 +17,10 @@ use pyo3::types::{PyBytes, PyList};
 #[cfg(feature = "py-bindings")]
 use pyo3::{pyclass, pymethods};
 
-fn get_bit(val: &[u8; 32], bit: u8) -> bool {
+fn get_bit(val: &[u8; 32], bit: u32) -> bool {
+    if bit >= 256 {
+        return false;
+    }
     (val[(bit / 8) as usize] & (0x80 >> (bit & 7))) != 0
 }
 // the ArrayTypes used to create a more lasting MerkleSet representation in the MerkleSet struct
@@ -102,7 +105,7 @@ impl MerkleSet {
                             proof.read_exact(&mut hash).map_err(|_| SetError)?;
                             // audit the leaf is correctly positioned by comparing its bits with the traced route
                             for (pos, v) in bits.iter().enumerate() {
-                                if get_bit(&hash, pos as u8) != *v {
+                                if get_bit(&hash, pos as u32) != *v {
                                     return Err(SetError);
                                 }
                             }
@@ -222,7 +225,7 @@ impl MerkleSet {
         current_node_index: usize,
         leaf: &[u8; 32],
         proof: &mut Vec<u8>,
-        depth: u8,
+        depth: u32,
     ) -> Result<bool, SetError> {
         match self.nodes_vec[current_node_index].0 {
             ArrayTypes::Empty => {
@@ -258,10 +261,10 @@ impl MerkleSet {
                 if get_bit(leaf, depth) {
                     // bit is 1 so truncate left branch and search right branch
                     self.other_included(left as usize, proof);
-                    self.generate_proof_impl(right as usize, leaf, proof, depth + 1)
+                    self.generate_proof_impl(right as usize, leaf, proof, depth.saturating_add(1))
                 } else {
                     // bit is 0 is search left and then truncate right branch
-                    let r = self.generate_proof_impl(left as usize, leaf, proof, depth + 1)?;
+                    let r = self.generate_proof_impl(left as usize, leaf, proof, depth.saturating_add(1))?;
                     self.other_included(right as usize, proof);
                     Ok(r)
                 }
@@ -306,7 +309,7 @@ impl MerkleSet {
 // computed. So the current proof format does not support early truncation of
 // these kinds of trees. We would need a new code, say "4", to mean truncated
 // double node.
-fn pad_middles_for_proof_gen(proof: &mut Vec<u8>, left: &[u8; 32], right: &[u8; 32], depth: u8) {
+fn pad_middles_for_proof_gen(proof: &mut Vec<u8>, left: &[u8; 32], right: &[u8; 32], depth: u32) {
     let left_bit = get_bit(left, depth);
     let right_bit = get_bit(right, depth);
     proof.push(MIDDLE);
@@ -318,9 +321,9 @@ fn pad_middles_for_proof_gen(proof: &mut Vec<u8>, left: &[u8; 32], right: &[u8; 
     } else if left_bit {
         // left bit is 1 so we should make an empty node left and children right
         proof.push(EMPTY);
-        pad_middles_for_proof_gen(proof, left, right, depth + 1);
+        pad_middles_for_proof_gen(proof, left, right, depth.saturating_add(1));
     } else {
-        pad_middles_for_proof_gen(proof, left, right, depth + 1);
+        pad_middles_for_proof_gen(proof, left, right, depth.saturating_add(1));
         proof.push(EMPTY);
     }
 }
@@ -418,7 +421,7 @@ impl MerkleSet {
     fn generate_merkle_tree_recurse(
         &mut self,
         range: &mut [[u8; 32]],
-        depth: u8,
+        depth: u32,
     ) -> ([u8; 32], NodeType) {
         assert!(!range.is_empty());
 
@@ -464,7 +467,7 @@ impl MerkleSet {
         let right_empty: bool = right == range.len() as i32 - 1;
 
         if left_empty || right_empty {
-            if depth == 255 {
+            if depth >= 255 {
                 // if every bit is identical, we have a duplicate value
                 // duplicate values are collapsed (since this is a set)
                 // so just return one of the duplicates as if there was only one
@@ -475,7 +478,7 @@ impl MerkleSet {
             } else {
                 // this means either the left or right bucket/sub tree was empty.
                 // let left_child_index: u32 =  self.nodes_vec.len() as u32;
-                let (child_hash, child_type) = self.generate_merkle_tree_recurse(range, depth + 1);
+                let (child_hash, child_type) = self.generate_merkle_tree_recurse(range, depth.saturating_add(1));
 
                 // in this case we may need to insert an Empty node (prefix 0 and a
                 // blank hash)
@@ -502,7 +505,7 @@ impl MerkleSet {
                     (child_hash, child_type)
                 }
             }
-        } else if depth == 255 {
+        } else if depth >= 255 {
             // this is an edge case where we make it all the way down to the
             // bottom of the tree, and split the last pair. This has the same
             // effect as the else-block, but since we use u8 for depth, it would
@@ -528,11 +531,11 @@ impl MerkleSet {
             // we are a middle node
             // recursively sort and hash our left and right children and return the resultant hash upwards
             let (left_hash, left_type) =
-                self.generate_merkle_tree_recurse(&mut range[..left as usize], depth + 1);
+                self.generate_merkle_tree_recurse(&mut range[..left as usize], depth.saturating_add(1));
             // make a note of where the left child node is
             let left_child_index: u32 = self.nodes_vec.len() as u32 - 1;
             let (right_hash, right_type) =
-                self.generate_merkle_tree_recurse(&mut range[left as usize..], depth + 1);
+                self.generate_merkle_tree_recurse(&mut range[left as usize..], depth.saturating_add(1));
 
             let node_hash = hash(left_type, right_type, &left_hash, &right_hash);
             let node_type: NodeType = if left_type == NodeType::Term && right_type == NodeType::Term
@@ -773,5 +776,23 @@ mod tests {
             test_tree(&mut leafs.clone());
             assert_eq!(MerkleSet::from_leafs(&mut leafs).get_root(), root);
         }
+    }
+
+    #[test]
+    fn test_merkle_set_large_depth() {
+        let mut proof = Vec::new();
+        for _ in 0..256 {
+            proof.push(MIDDLE);
+        }
+        proof.push(TERMINAL);
+        proof.extend_from_slice(&[0; 32]);
+        for _ in 0..256 {
+            proof.push(EMPTY);
+        }
+
+        let tree = MerkleSet::from_proof(&proof).expect("Failed to build tree");
+        // This used to panic due to u8 overflow in depth + 1
+        let (included, _) = tree.generate_proof(&[0; 32]).expect("failed to generate proof");
+        assert!(included);
     }
 }
